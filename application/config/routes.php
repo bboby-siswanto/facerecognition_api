@@ -70,3 +70,12 @@ $route['api/v1/employees'] = 'api/v1/Face_attendance/employees_create';
 $route['api/v1/employees/(:any)/faces'] = 'api/v1/Face_attendance/employee_faces_create/$1';
 $route['api/v1/employees/sync'] = 'api/v1/Face_attendance/employees_sync';
 $route['api/v1/employees/sync/acknowledge'] = 'api/v1/Face_attendance/employees_sync_acknowledge';
+
+// Attendance routes
+// IMPORTANT: specific routes must come before wildcard (:any) routes
+$route['api/v1/attendances'] = 'api/v1/Face_attendance/attendances_create';
+$route['api/v1/attendances/bulk'] = 'api/v1/Face_attendance/attendances_bulk';
+$route['api/v1/attendances/(:any)'] = 'api/v1/Face_attendance/attendances_detail/$1';
+
+// System log routes
+$route['api/v1/system-logs/bulk'] = 'api/v1/Face_attendance/system_logs_bulk';

@@ -305,4 +305,78 @@ class Face_attendance extends MY_API_Controller {
         $this->respond_error('Employee sync acknowledge failed', $status, $code);
     }
 
+    // POST /api/v1/attendances
+    public function attendances_create()
+    {
+        $this->require_method('POST');
+
+        $device_id = $this->request_header('X-Device-ID');
+        $auth      = $this->request_header('Authorization');
+        $raw       = null;
+        if ($auth && preg_match('/Bearer\s+(.*)$/i', $auth, $m)) {
+            $raw = $m[1];
+        }
+
+        $body = $this->input_json();
+        $meta = array(
+            'request_id' => $this->request_id,
+            'endpoint'   => 'attendances',
+            'method'     => 'POST'
+        );
+
+        $res = $this->service->attendances_create($device_id, $raw, $body, $meta);
+
+        if (isset($res['status']) && $res['status'] === 200) {
+            $this->respond_success('Attendance recorded', $res['data'], 200);
+            return;
+        }
+
+        if (isset($res['status']) && $res['status'] === 422) {
+            $errors = isset($res['errors']) ? $res['errors'] : null;
+            $code   = isset($res['error_code']) ? $res['error_code'] : 'VALIDATION_ERROR';
+            $this->respond_error('Validation failed', 422, $code, $errors);
+            return;
+        }
+
+        if (isset($res['status']) && $res['status'] === 409) {
+            $this->respond_error('Duplicate attendance', 409, 'DUPLICATE_ATTENDANCE');
+            return;
+        }
+
+        $code   = isset($res['error_code']) ? $res['error_code'] : 'INTERNAL_ERROR';
+        $status = isset($res['status'])     ? $res['status']     : 500;
+        $this->respond_error('Attendance failed', $status, $code);
+    }
+
+    // GET /api/v1/attendances/{attendance_id}
+    public function attendances_detail($attendance_id)
+    {
+        $this->require_method('GET');
+
+        $device_id = $this->request_header('X-Device-ID');
+        $auth      = $this->request_header('Authorization');
+        $raw       = null;
+        if ($auth && preg_match('/Bearer\s+(.*)$/i', $auth, $m)) {
+            $raw = $m[1];
+        }
+
+        $meta = array(
+            'request_id' => $this->request_id,
+            'endpoint'   => 'attendances/detail',
+            'method'     => 'GET'
+        );
+
+        $res = $this->service->attendances_detail($attendance_id, $device_id, $raw, $meta);
+
+        if (isset($res['status']) && $res['status'] === 200) {
+            $this->respond_success('Attendance detail', $res['data'], 200);
+            return;
+        }
+
+        $code   = isset($res['error_code']) ? $res['error_code'] : 'INTERNAL_ERROR';
+        $status = isset($res['status'])     ? $res['status']     : 500;
+        $this->respond_error('Attendance detail failed', $status, $code);
+    }
+
 }
+

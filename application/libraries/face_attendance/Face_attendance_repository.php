@@ -280,4 +280,63 @@ class Face_attendance_repository
         return false;
     }
 
+    // ---------------------------------------------------------------------------
+    // Attendances
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Find an attendance record by its unique attendance_id string.
+     */
+    public function find_attendance_by_id($attendance_id)
+    {
+        $q = $this->db->get_where('fa_attendances', array('attendance_id' => $attendance_id));
+        return $q->row_array();
+    }
+
+    /**
+     * Find an attendance record by the combination of device_id + request_id.
+     * Used for idempotency: if the same device submits the same request_id twice,
+     * we return the existing record instead of creating a new one.
+     */
+    public function find_attendance_by_device_request($device_id, $request_id)
+    {
+        if (empty($request_id)) {
+            return null;
+        }
+        $q = $this->db->get_where('fa_attendances', array(
+            'device_id'  => $device_id,
+            'request_id' => $request_id
+        ));
+        return $q->row_array();
+    }
+
+    /**
+     * Insert a new attendance record into fa_attendances.
+     * Returns the auto-increment id on success, or FALSE on failure.
+     */
+    public function create_attendance($data)
+    {
+        $row = $data;
+        $row['created_at'] = date('Y-m-d H:i:s');
+        $row['updated_at'] = date('Y-m-d H:i:s');
+        $this->db->insert('fa_attendances', $row);
+        if ($this->db->affected_rows() < 1) {
+            return false;
+        }
+        return $this->db->insert_id();
+    }
+
+    /**
+     * Insert a row into fa_attendance_logs.
+     * status values: 'accepted', 'rejected', 'duplicate'
+     * Does NOT contain photo_base64 or token values.
+     */
+    public function create_attendance_log($data)
+    {
+        $row = $data;
+        $row['created_at'] = date('Y-m-d H:i:s');
+        $this->db->insert('fa_attendance_logs', $row);
+        return $this->db->insert_id();
+    }
+
 }

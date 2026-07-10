@@ -591,6 +591,11 @@ class Face_attendance_service
                 'is_deleted' => 0,
                 'deleted_at' => null
             ));
+            // Bug fix: CI3 does not throw PHP Exception on query failure when db_debug=FALSE.
+            // Must check trans_status() explicitly to detect a failed INSERT.
+            if ($this->CI->db->trans_status() === FALSE) {
+                throw new Exception('DB insert failed (trans_status=FALSE)');
+            }
             $this->repo->commit();
             $this->log_request($meta, $device_id, 200, null, $start);
             return array('status' => 200, 'data' => array('employee_code' => $filtered['employee_code'], 'employee_id' => $employee_id));
@@ -748,6 +753,10 @@ class Face_attendance_service
                 'is_deleted' => 0,
                 'deleted_at' => null
             ));
+            // Bug fix: CI3 does not throw PHP Exception on query failure when db_debug=FALSE.
+            if ($this->CI->db->trans_status() === FALSE) {
+                throw new Exception('DB insert failed (trans_status=FALSE)');
+            }
             $this->repo->commit();
             $this->log_request($meta, $device_id, 200, null, $start);
             return array('status' => 200, 'data' => array('face_id' => $filtered['face_id'], 'image_path' => $stored_path));
@@ -780,6 +789,464 @@ class Face_attendance_service
         );
         // do not log sensitive tokens
         $this->repo->log_api_request($row);
+    }
+
+    // ===========================================================================
+    // ATTENDANCE
+    // ===========================================================================
+
+    /**
+     * Record a single attendance event from a device.
+     *
+     * @param string $header_device_id  Value of X-Device-ID header
+     * @param string $access_raw        Raw bearer token string
+     * @param array  $payload           Decoded JSON body
+     * @param array  $meta              Request metadata (request_id, endpoint, method)
+     * @return array {status, data} or {status, error_code, [errors]}
+     */
+    public function attendances_create($header_device_id, $access_raw, $payload, $meta)
+    {
+        $start = microtime(true);
+
+        // ------------------------------------------------------------------
+        // 1. Preliminary presence checks
+        // ------------------------------------------------------------------
+        if (empty($header_device_id) || empty($access_raw)) {
+            $this->log_request($meta, $header_device_id, 401, 'UNAUTHORIZED', $start);
+            return array('status' => 401, 'error_code' => 'UNAUTHORIZED');
+        }
+
+        // ------------------------------------------------------------------
+        // 2. Payload field validation
+        // ------------------------------------------------------------------
+        $allowed = array(
+            'attendance_id', 'employee_code', 'device_id', 'attendance_type',
+            'attendance_at', 'recognition_confidence', 'liveness_score',
+            'face_version', 'photo_base64', 'latitude', 'longitude',
+            'source', 'request_id'
+        );
+        $filtered = array();
+        foreach ($allowed as $field) {
+            if (array_key_exists($field, $payload)) {
+                $filtered[$field] = $payload[$field];
+            }
+        }
+
+        $rules = array(
+            'attendance_id'           => 'required|string',
+            'employee_code'           => 'required|string',
+            'device_id'               => 'required|string',
+            'attendance_type'         => 'required|enum:check_in,check_out,break_out,break_in',
+            'attendance_at'           => 'required|string',
+            'recognition_confidence'  => 'score',
+            'liveness_score'          => 'score',
+            'face_version'            => 'integer',
+            'source'                  => 'string',
+            'request_id'              => 'string'
+        );
+        $errors = $this->validator->validate($filtered, $rules);
+        if (!empty($errors)) {
+            $this->_log_attendance_event(
+                isset($filtered['attendance_id']) ? $filtered['attendance_id'] : null,
+                $header_device_id,
+                isset($filtered['employee_code']) ? $filtered['employee_code'] : null,
+                'rejected', 'VALIDATION_ERROR',
+                isset($meta['request_id']) ? $meta['request_id'] : null,
+                $start
+            );
+            $this->log_request($meta, $header_device_id, 422, 'VALIDATION_ERROR', $start);
+            return array('status' => 422, 'error_code' => 'VALIDATION_ERROR', 'errors' => $errors);
+        }
+
+        // ------------------------------------------------------------------
+        // 3. device_id body must equal X-Device-ID header
+        // ------------------------------------------------------------------
+        if ($filtered['device_id'] !== $header_device_id) {
+            $this->_log_attendance_event(
+                $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                'rejected', 'DEVICE_MISMATCH',
+                isset($filtered['request_id']) ? $filtered['request_id'] : null, $start
+            );
+            $this->log_request($meta, $header_device_id, 403, 'DEVICE_MISMATCH', $start);
+            return array('status' => 403, 'error_code' => 'DEVICE_MISMATCH');
+        }
+
+        // ------------------------------------------------------------------
+        // 4. request_id body must equal X-Request-ID header (if header sent)
+        // ------------------------------------------------------------------
+        $header_request_id = isset($meta['request_id']) ? $meta['request_id'] : null;
+        $body_request_id   = isset($filtered['request_id']) ? $filtered['request_id'] : null;
+        if (!empty($body_request_id) && !empty($header_request_id) && $body_request_id !== $header_request_id) {
+            $this->_log_attendance_event(
+                $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                'rejected', 'REQUEST_ID_MISMATCH',
+                $body_request_id, $start
+            );
+            $this->log_request($meta, $header_device_id, 422, 'REQUEST_ID_MISMATCH', $start);
+            return array(
+                'status' => 422, 'error_code' => 'REQUEST_ID_MISMATCH',
+                'errors' => array('request_id' => array('request_id body must match X-Request-ID header'))
+            );
+        }
+        // Prefer header request_id as the canonical one (already set in $meta['request_id'])
+        $canonical_request_id = !empty($header_request_id) ? $header_request_id : $body_request_id;
+
+        // ------------------------------------------------------------------
+        // 5. Validate access token
+        // ------------------------------------------------------------------
+        $val = $this->auth->validate_access_token($access_raw, $header_device_id);
+        if (!$val['ok']) {
+            $code = ($val['error'] === 'TOKEN_EXPIRED') ? 'TOKEN_EXPIRED' : 'UNAUTHORIZED';
+            $this->_log_attendance_event(
+                $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                'rejected', $code, $canonical_request_id, $start
+            );
+            $this->log_request($meta, $header_device_id, 401, $code, $start);
+            return array('status' => 401, 'error_code' => $code);
+        }
+
+        // ------------------------------------------------------------------
+        // 6. Verify device exists and is active
+        // ------------------------------------------------------------------
+        $device = $this->repo->get_device_by_id($header_device_id);
+        if (!$device) {
+            $this->_log_attendance_event(
+                $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                'rejected', 'NOT_FOUND', $canonical_request_id, $start
+            );
+            $this->log_request($meta, $header_device_id, 404, 'NOT_FOUND', $start);
+            return array('status' => 404, 'error_code' => 'NOT_FOUND');
+        }
+        if (!isset($device['status']) || $device['status'] !== 'active') {
+            $this->_log_attendance_event(
+                $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                'rejected', 'DEVICE_INACTIVE', $canonical_request_id, $start
+            );
+            $this->log_request($meta, $header_device_id, 403, 'DEVICE_INACTIVE', $start);
+            return array('status' => 403, 'error_code' => 'DEVICE_INACTIVE');
+        }
+
+        // ------------------------------------------------------------------
+        // 7. Idempotency: device_id + request_id already processed?
+        // ------------------------------------------------------------------
+        if (!empty($canonical_request_id)) {
+            $existing_by_req = $this->repo->find_attendance_by_device_request(
+                $header_device_id, $canonical_request_id
+            );
+            if ($existing_by_req) {
+                // Already recorded — return existing data without creating a new record
+                $this->_log_attendance_event(
+                    $existing_by_req['attendance_id'], $header_device_id,
+                    $existing_by_req['employee_code'],
+                    'duplicate', 'IDEMPOTENT_REPLAY', $canonical_request_id, $start
+                );
+                $this->log_request($meta, $header_device_id, 200, 'IDEMPOTENT_REPLAY', $start);
+                return array(
+                    'status' => 200,
+                    'data'   => $this->_format_attendance($existing_by_req)
+                );
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 8. Duplicate attendance_id check
+        // ------------------------------------------------------------------
+        $existing_att = $this->repo->find_attendance_by_id($filtered['attendance_id']);
+        if ($existing_att) {
+            $this->_log_attendance_event(
+                $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                'rejected', 'DUPLICATE_ATTENDANCE', $canonical_request_id, $start
+            );
+            $this->log_request($meta, $header_device_id, 409, 'DUPLICATE_ATTENDANCE', $start);
+            return array('status' => 409, 'error_code' => 'DUPLICATE_ATTENDANCE');
+        }
+
+        // ------------------------------------------------------------------
+        // 9. Verify employee exists, is active, and not deleted
+        // ------------------------------------------------------------------
+        $employee = $this->repo->get_employee_by_code($filtered['employee_code']);
+        if (!$employee) {
+            $this->_log_attendance_event(
+                $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                'rejected', 'EMPLOYEE_NOT_FOUND', $canonical_request_id, $start
+            );
+            $this->log_request($meta, $header_device_id, 404, 'EMPLOYEE_NOT_FOUND', $start);
+            return array('status' => 404, 'error_code' => 'EMPLOYEE_NOT_FOUND');
+        }
+        if (!empty($employee['is_deleted']) && (int) $employee['is_deleted'] === 1) {
+            $this->_log_attendance_event(
+                $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                'rejected', 'EMPLOYEE_DELETED', $canonical_request_id, $start
+            );
+            $this->log_request($meta, $header_device_id, 422, 'EMPLOYEE_DELETED', $start);
+            return array('status' => 422, 'error_code' => 'EMPLOYEE_DELETED');
+        }
+        if (!isset($employee['status']) || $employee['status'] !== 'active') {
+            $this->_log_attendance_event(
+                $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                'rejected', 'EMPLOYEE_INACTIVE', $canonical_request_id, $start
+            );
+            $this->log_request($meta, $header_device_id, 422, 'EMPLOYEE_INACTIVE', $start);
+            return array('status' => 422, 'error_code' => 'EMPLOYEE_INACTIVE');
+        }
+
+        // ------------------------------------------------------------------
+        // 10. Handle optional photo_base64
+        // ------------------------------------------------------------------
+        $photo_path      = null;
+        $photo_hash      = null;
+        $photo_mime      = null;
+        $photo_size_bytes = null;
+
+        if (!empty($filtered['photo_base64'])) {
+            $image_data = $filtered['photo_base64'];
+            $matches    = array();
+            if (preg_match('/^data:(image\/(jpeg|png));base64,(.+)$/i', $image_data, $matches)) {
+                $photo_mime    = strtolower($matches[1]);
+                $image_binary  = base64_decode($matches[3], true);
+                if ($image_binary === false) {
+                    $this->_log_attendance_event(
+                        $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                        'rejected', 'INVALID_PHOTO', $canonical_request_id, $start
+                    );
+                    $this->log_request($meta, $header_device_id, 422, 'INVALID_PHOTO', $start);
+                    return array(
+                        'status' => 422, 'error_code' => 'INVALID_PHOTO',
+                        'errors' => array('photo_base64' => array('Invalid base64 image data'))
+                    );
+                }
+                $photo_size_bytes = strlen($image_binary);
+                $max_size = (int) $this->CI->config->item('fa_max_face_image_size_bytes', 'face_attendance');
+                if ($max_size > 0 && $photo_size_bytes > $max_size) {
+                    $this->_log_attendance_event(
+                        $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                        'rejected', 'PHOTO_TOO_LARGE', $canonical_request_id, $start
+                    );
+                    $this->log_request($meta, $header_device_id, 422, 'PHOTO_TOO_LARGE', $start);
+                    return array(
+                        'status' => 422, 'error_code' => 'PHOTO_TOO_LARGE',
+                        'errors' => array('photo_base64' => array('Photo exceeds configured size limit'))
+                    );
+                }
+                // Ensure upload directory exists
+                $upload_root  = rtrim($this->CI->config->item('fa_upload_path', 'face_attendance'), '/') . '/attendances/';
+                $att_dir      = $upload_root . $filtered['attendance_id'] . '/';
+                if (!is_dir($att_dir)) {
+                    if (!mkdir($att_dir, 0755, true) && !is_dir($att_dir)) {
+                        $this->log_request($meta, $header_device_id, 500, 'INTERNAL_ERROR', $start);
+                        return array('status' => 500, 'error_code' => 'INTERNAL_ERROR');
+                    }
+                }
+                $ext         = ($photo_mime === 'image/png') ? 'png' : 'jpg';
+                $filename    = 'photo_' . time() . '.' . $ext;
+                $full_path   = $att_dir . $filename;
+                $relative_dir = 'uploads/face_attendance/attendances/' . $filtered['attendance_id'] . '/';
+                $photo_path  = $relative_dir . $filename;
+                $photo_hash  = hash('sha256', $image_binary);
+
+                if (file_put_contents($full_path, $image_binary) === false) {
+                    $this->log_request($meta, $header_device_id, 500, 'INTERNAL_ERROR', $start);
+                    return array('status' => 500, 'error_code' => 'INTERNAL_ERROR');
+                }
+            } else {
+                $this->_log_attendance_event(
+                    $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                    'rejected', 'INVALID_PHOTO', $canonical_request_id, $start
+                );
+                $this->log_request($meta, $header_device_id, 422, 'INVALID_PHOTO', $start);
+                return array(
+                    'status' => 422, 'error_code' => 'INVALID_PHOTO',
+                    'errors' => array('photo_base64' => array('Photo must be a valid data URL (image/jpeg or image/png)'))
+                );
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 11. Build attendance row and persist in a transaction
+        // ------------------------------------------------------------------
+        $now        = date('Y-m-d H:i:s');
+        $att_row    = array(
+            'attendance_id'          => $filtered['attendance_id'],
+            'device_id'              => $header_device_id,
+            'employee_code'          => $filtered['employee_code'],
+            'attendance_type'        => $filtered['attendance_type'],
+            // attendance_at: store device-reported time as-is
+            'attendance_at'          => $filtered['attendance_at'],
+            // recorded_at: always server time
+            'recorded_at'            => $now,
+            'recognition_confidence' => isset($filtered['recognition_confidence']) ? (float) $filtered['recognition_confidence'] : null,
+            'liveness_score'         => isset($filtered['liveness_score'])         ? (float) $filtered['liveness_score']         : null,
+            'face_version'           => isset($filtered['face_version'])           ? (int)   $filtered['face_version']           : null,
+            'photo_path'             => $photo_path,
+            'photo_hash'             => $photo_hash,
+            'latitude'               => isset($filtered['latitude'])               ? (float) $filtered['latitude']               : null,
+            'longitude'              => isset($filtered['longitude'])              ? (float) $filtered['longitude']              : null,
+            'source'                 => isset($filtered['source'])                 ? $filtered['source']                         : null,
+            'request_id'             => $canonical_request_id,
+            'status'                 => 'accepted'
+        );
+
+        $this->repo->begin();
+        try {
+            $db_id = $this->repo->create_attendance($att_row);
+            if ($db_id === false || $this->CI->db->trans_status() === FALSE) {
+                throw new Exception('DB insert failed');
+            }
+            $this->repo->commit();
+        } catch (Exception $e) {
+            $this->repo->rollback();
+            // If photo was written, remove it to keep filesystem consistent
+            if ($photo_path && is_file(FCPATH . $photo_path)) {
+                @unlink(FCPATH . $photo_path);
+            }
+            log_message('error', 'Create attendance failed: ' . $e->getMessage());
+            $this->log_request($meta, $header_device_id, 500, 'INTERNAL_ERROR', $start);
+            return array('status' => 500, 'error_code' => 'INTERNAL_ERROR');
+        }
+
+        // ------------------------------------------------------------------
+        // 12. Write attendance audit log (outside transaction — best-effort)
+        // ------------------------------------------------------------------
+        $this->_log_attendance_event(
+            $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+            'accepted', null, $canonical_request_id, $start
+        );
+
+        // ------------------------------------------------------------------
+        // 13. Write API request log
+        // ------------------------------------------------------------------
+        $this->log_request($meta, $header_device_id, 200, null, $start);
+
+        return array(
+            'status' => 200,
+            'data'   => $this->_format_attendance($att_row)
+        );
+    }
+
+    /**
+     * Retrieve a single attendance record by attendance_id.
+     * Access is restricted to the device that created the record.
+     *
+     * @param string $attendance_id
+     * @param string $header_device_id  Value of X-Device-ID header
+     * @param string $access_raw        Raw bearer token string
+     * @param array  $meta
+     * @return array
+     */
+    public function attendances_detail($attendance_id, $header_device_id, $access_raw, $meta)
+    {
+        $start = microtime(true);
+
+        // ------------------------------------------------------------------
+        // 1. Preliminary checks
+        // ------------------------------------------------------------------
+        if (empty($header_device_id) || empty($access_raw)) {
+            $this->log_request($meta, $header_device_id, 401, 'UNAUTHORIZED', $start);
+            return array('status' => 401, 'error_code' => 'UNAUTHORIZED');
+        }
+
+        // ------------------------------------------------------------------
+        // 2. Validate access token
+        // ------------------------------------------------------------------
+        $val = $this->auth->validate_access_token($access_raw, $header_device_id);
+        if (!$val['ok']) {
+            $code = ($val['error'] === 'TOKEN_EXPIRED') ? 'TOKEN_EXPIRED' : 'UNAUTHORIZED';
+            $this->log_request($meta, $header_device_id, 401, $code, $start);
+            return array('status' => 401, 'error_code' => $code);
+        }
+
+        // ------------------------------------------------------------------
+        // 3. Verify device exists and is active
+        // ------------------------------------------------------------------
+        $device = $this->repo->get_device_by_id($header_device_id);
+        if (!$device) {
+            $this->log_request($meta, $header_device_id, 404, 'NOT_FOUND', $start);
+            return array('status' => 404, 'error_code' => 'NOT_FOUND');
+        }
+        if (!isset($device['status']) || $device['status'] !== 'active') {
+            $this->log_request($meta, $header_device_id, 403, 'DEVICE_INACTIVE', $start);
+            return array('status' => 403, 'error_code' => 'DEVICE_INACTIVE');
+        }
+
+        // ------------------------------------------------------------------
+        // 4. Find the attendance record
+        // ------------------------------------------------------------------
+        $attendance = $this->repo->find_attendance_by_id($attendance_id);
+        if (!$attendance) {
+            $this->log_request($meta, $header_device_id, 404, 'NOT_FOUND', $start);
+            return array('status' => 404, 'error_code' => 'NOT_FOUND');
+        }
+
+        // ------------------------------------------------------------------
+        // 5. Enforce device ownership
+        //    Only the device that created the record may read it.
+        // ------------------------------------------------------------------
+        if ($attendance['device_id'] !== $header_device_id) {
+            $this->log_request($meta, $header_device_id, 403, 'FORBIDDEN', $start);
+            return array('status' => 403, 'error_code' => 'FORBIDDEN');
+        }
+
+        $this->log_request($meta, $header_device_id, 200, null, $start);
+        return array(
+            'status' => 200,
+            'data'   => $this->_format_attendance($attendance)
+        );
+    }
+
+    /**
+     * Normalise an attendance row for API response.
+     * Removes internal DB fields (id, created_at, updated_at).
+     * Never exposes photo_hash or raw token data.
+     */
+    protected function _format_attendance($row)
+    {
+        return array(
+            'attendance_id'          => isset($row['attendance_id'])          ? $row['attendance_id']          : null,
+            'device_id'              => isset($row['device_id'])              ? $row['device_id']              : null,
+            'employee_code'          => isset($row['employee_code'])          ? $row['employee_code']          : null,
+            'attendance_type'        => isset($row['attendance_type'])        ? $row['attendance_type']        : null,
+            'attendance_at'          => isset($row['attendance_at'])          ? $row['attendance_at']          : null,
+            'recorded_at'            => isset($row['recorded_at'])            ? $row['recorded_at']            : null,
+            'recognition_confidence' => isset($row['recognition_confidence']) ? (float) $row['recognition_confidence'] : null,
+            'liveness_score'         => isset($row['liveness_score'])         ? (float) $row['liveness_score']         : null,
+            'face_version'           => isset($row['face_version'])           ? (int)   $row['face_version']           : null,
+            'photo_path'             => isset($row['photo_path'])             ? $row['photo_path']             : null,
+            'latitude'               => isset($row['latitude'])               ? (float) $row['latitude']               : null,
+            'longitude'              => isset($row['longitude'])              ? (float) $row['longitude']              : null,
+            'source'                 => isset($row['source'])                 ? $row['source']                 : null,
+            'request_id'             => isset($row['request_id'])             ? $row['request_id']             : null,
+            'status'                 => isset($row['status'])                 ? $row['status']                 : null
+        );
+    }
+
+    /**
+     * Insert a record into fa_attendance_logs.
+     * This is separate from the main transaction so audit log is always written.
+     * IMPORTANT: must never log photo_base64, access_token, or refresh_token.
+     *
+     * @param string      $attendance_id
+     * @param string      $device_id
+     * @param string|null $employee_code
+     * @param string      $status        accepted | rejected | duplicate
+     * @param string|null $reason        Error code string or null
+     * @param string|null $request_id
+     * @param float       $start_time    microtime(true) at request start
+     */
+    protected function _log_attendance_event(
+        $attendance_id, $device_id, $employee_code,
+        $status, $reason, $request_id, $start_time
+    ) {
+        $duration = round((microtime(true) - $start_time) * 1000);
+        $this->repo->create_attendance_log(array(
+            'attendance_id' => $attendance_id,
+            'device_id'     => $device_id,
+            'employee_code' => $employee_code,
+            'status'        => $status,
+            'reason'        => $reason,
+            'request_id'    => $request_id,
+            'ip'            => $this->ip_address(),
+            'duration_ms'   => $duration
+        ));
     }
 
 }
