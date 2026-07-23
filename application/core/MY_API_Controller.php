@@ -91,8 +91,32 @@ class MY_API_Controller extends CI_Controller {
 
     protected function request_header($name, $default = null)
     {
+        // Primary: CI3's built-in method (works for most headers under mod_php)
         $v = $this->input->get_request_header($name, TRUE);
-        return ($v === NULL) ? $default : $v;
+        if ($v !== NULL) {
+            return $v;
+        }
+
+        // Fallback for Authorization header stripped by Apache CGI/FastCGI.
+        // The .htaccess RewriteRule sets HTTP_AUTHORIZATION; Apache may also
+        // expose it as REDIRECT_HTTP_AUTHORIZATION after an internal redirect.
+        if (strcasecmp($name, 'Authorization') === 0) {
+            if (!empty($_SERVER['HTTP_AUTHORIZATION'])) {
+                return $_SERVER['HTTP_AUTHORIZATION'];
+            }
+            if (!empty($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
+                return $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+            }
+            // PHP-FPM / some FastCGI configs pass it without the HTTP_ prefix
+            if (function_exists('apache_request_headers')) {
+                $headers = apache_request_headers();
+                if (!empty($headers['Authorization'])) {
+                    return $headers['Authorization'];
+                }
+            }
+        }
+
+        return $default;
     }
 
     protected function query($key = null, $default = null)

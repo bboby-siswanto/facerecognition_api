@@ -44,6 +44,10 @@ class Face_attendance_repository
 
     public function update_device_login_info($device_id, $data)
     {
+        if (isset($data['ip'])) {
+            $data['ip_address'] = $data['ip'];
+            unset($data['ip']);
+        }
         return $this->db->where('device_id', $device_id)->update('fa_devices', $data);
     }
 
@@ -51,16 +55,18 @@ class Face_attendance_repository
     public function create_device_token($device_id, $access_token_hash, $refresh_token_hash, $access_expires_at, $refresh_expires_at, $meta)
     {
         $row = array(
-            'device_id' => $device_id,
-            'access_token_hash' => $access_token_hash,
-            'refresh_token_hash' => $refresh_token_hash,
-            'expires_at' => $access_expires_at,
-            'refresh_expires_at' => $refresh_expires_at,
-            'revoked' => 0,
+            'device_id'            => $device_id,
+            'access_token_hash'    => $access_token_hash,
+            'refresh_token_hash'   => $refresh_token_hash,
+            'access_expires_at'    => $access_expires_at,
+            'refresh_expires_at'   => $refresh_expires_at,
+            'issued_ip_address'    => isset($meta['ip']) ? $meta['ip'] : null,
+            'last_used_ip_address' => isset($meta['ip']) ? $meta['ip'] : null,
+            'last_used_at'         => null,
+            'revoked_at'           => null,
             'replaced_by_token_id' => null,
-            'last_used_at' => null,
-            'created_at' => date('Y-m-d H:i:s'),
-            'meta' => json_encode($meta)
+            'created_at'           => date('Y-m-d H:i:s'),
+            'updated_at'           => date('Y-m-d H:i:s')
         );
         $this->db->insert('fa_device_tokens', $row);
         $id = $this->db->insert_id();
@@ -95,7 +101,7 @@ class Face_attendance_repository
 
     public function revoke_token($token_id, $replaced_by_token_id = null)
     {
-        $data = array('revoked' => 1, 'revoked_at' => date('Y-m-d H:i:s'));
+        $data = array('revoked_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s'));
         if ($replaced_by_token_id !== null) {
             $data['replaced_by_token_id'] = $replaced_by_token_id;
         }
@@ -110,9 +116,16 @@ class Face_attendance_repository
     // Device sessions
     public function create_device_session($device_id, $data)
     {
-        $row = $data;
-        $row['device_id'] = $device_id;
-        $row['created_at'] = date('Y-m-d H:i:s');
+        $meta = isset($data['meta']) ? json_decode($data['meta'], true) : array();
+        $row = array(
+            'device_id'    => $device_id,
+            'session_type' => isset($data['type']) ? $data['type'] : 'login',
+            'ip_address'   => isset($data['ip']) ? $data['ip'] : (isset($data['ip_address']) ? $data['ip_address'] : null),
+            'app_version'  => isset($meta['app_version']) ? $meta['app_version'] : null,
+            'platform'     => isset($meta['platform']) ? $meta['platform'] : null,
+            'message'      => isset($meta['note']) ? $meta['note'] : null,
+            'created_at'   => date('Y-m-d H:i:s')
+        );
         $this->db->insert('fa_device_sessions', $row);
         return $this->db->insert_id();
     }
@@ -263,8 +276,19 @@ class Face_attendance_repository
     // API request logs (audit)
     public function log_api_request($data)
     {
-        $row = $data;
-        $row['created_at'] = date('Y-m-d H:i:s');
+        $row = array(
+            'request_id'       => isset($data['request_id']) ? $data['request_id'] : null,
+            'device_id'        => isset($data['device_id']) ? $data['device_id'] : null,
+            'endpoint'         => isset($data['endpoint']) ? $data['endpoint'] : null,
+            'http_method'      => isset($data['http_method']) ? $data['http_method'] : (isset($data['method']) ? $data['method'] : null),
+            'http_status'      => isset($data['http_status']) ? (int)$data['http_status'] : 200,
+            'error_code'       => isset($data['error_code']) ? $data['error_code'] : null,
+            'ip_address'       => isset($data['ip_address']) ? $data['ip_address'] : (isset($data['ip']) ? $data['ip'] : null),
+            'request_payload'  => isset($data['request_payload']) ? $data['request_payload'] : null,
+            'response_payload' => isset($data['response_payload']) ? $data['response_payload'] : null,
+            'duration_ms'      => isset($data['duration_ms']) ? (int)$data['duration_ms'] : null,
+            'created_at'       => date('Y-m-d H:i:s')
+        );
         $this->db->insert('fa_api_request_logs', $row);
         return $this->db->insert_id();
     }
@@ -336,6 +360,34 @@ class Face_attendance_repository
         $row = $data;
         $row['created_at'] = date('Y-m-d H:i:s');
         $this->db->insert('fa_attendance_logs', $row);
+        return $this->db->insert_id();
+    }
+
+    // ---------------------------------------------------------------------------
+    // System Logs
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Find a system log by log_id.
+     */
+    public function find_system_log_by_id($log_id)
+    {
+        $q = $this->db->get_where('fa_system_logs', array('log_id' => $log_id));
+        return $q->row_array();
+    }
+
+    /**
+     * Insert a new system log.
+     */
+    public function create_system_log($data)
+    {
+        $row = $data;
+        $row['received_at'] = date('Y-m-d H:i:s');
+        $row['created_at'] = date('Y-m-d H:i:s');
+        $this->db->insert('fa_system_logs', $row);
+        if ($this->db->affected_rows() < 1) {
+            return false;
+        }
         return $this->db->insert_id();
     }
 

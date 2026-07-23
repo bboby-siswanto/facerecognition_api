@@ -771,23 +771,28 @@ class Face_attendance_service
         }
     }
 
-    protected function log_request($meta, $device_id, $http_status, $error_code = null, $start_time = null)
-    {
+    protected function log_request(
+        $meta, $device_id, $http_status,
+        $error_code = null, $start_time = null,
+        $request_payload = null, $response_payload = null
+    ) {
         $duration = null;
         if ($start_time !== null) {
             $duration = round((microtime(true) - $start_time) * 1000); // ms
         }
         $row = array(
-            'request_id' => isset($meta['request_id']) ? $meta['request_id'] : null,
-            'device_id' => $device_id,
-            'endpoint' => isset($meta['endpoint']) ? $meta['endpoint'] : null,
-            'method' => isset($meta['method']) ? $meta['method'] : null,
-            'http_status' => $http_status,
-            'error_code' => $error_code,
-            'ip' => $this->ip_address(),
-            'duration_ms' => $duration
+            'request_id'       => isset($meta['request_id']) ? $meta['request_id'] : null,
+            'device_id'        => $device_id,
+            'endpoint'         => isset($meta['endpoint']) ? $meta['endpoint'] : null,
+            'http_method'      => isset($meta['method']) ? $meta['method'] : null,
+            'http_status'      => $http_status,
+            'error_code'       => $error_code,
+            'ip'               => $this->ip_address(),
+            'duration_ms'      => $duration,
+            // Only store sanitized payloads - callers must strip tokens/base64 before passing
+            'request_payload'  => ($request_payload !== null) ? json_encode($request_payload) : null,
+            'response_payload' => ($response_payload !== null) ? json_encode($response_payload) : null
         );
-        // do not log sensitive tokens
         $this->repo->log_api_request($row);
     }
 
@@ -1223,6 +1228,7 @@ class Face_attendance_service
      * Insert a record into fa_attendance_logs.
      * This is separate from the main transaction so audit log is always written.
      * IMPORTANT: must never log photo_base64, access_token, or refresh_token.
+     * Maps inputs to the actual database table columns.
      *
      * @param string      $attendance_id
      * @param string      $device_id
@@ -1236,17 +1242,694 @@ class Face_attendance_service
         $attendance_id, $device_id, $employee_code,
         $status, $reason, $request_id, $start_time
     ) {
+        if (empty($attendance_id)) {
+            return;
+        }
+
+        // Verify that the attendance_id exists in fa_attendances to satisfy the FK constraint.
+        // If the attendance record does not exist (e.g. for rejected requests), we cannot write to fa_attendance_logs.
+        $existing = $this->repo->find_attendance_by_id($attendance_id);
+        if (!$existing) {
+            log_message('debug', "Skipping fa_attendance_logs for $attendance_id: record does not exist in fa_attendances (Status: $status, Reason: $reason)");
+            return;
+        }
+
         $duration = round((microtime(true) - $start_time) * 1000);
+        $context = array(
+            'employee_code' => $employee_code,
+            'reason'        => $reason,
+            'request_id'    => $request_id,
+            'duration_ms'   => $duration,
+            'ip_address'    => $this->ip_address()
+        );
         $this->repo->create_attendance_log(array(
             'attendance_id' => $attendance_id,
             'device_id'     => $device_id,
-            'employee_code' => $employee_code,
-            'status'        => $status,
-            'reason'        => $reason,
-            'request_id'    => $request_id,
-            'ip'            => $this->ip_address(),
-            'duration_ms'   => $duration
+            'event_type'    => $status, // accepted | rejected | duplicate
+            'status_before' => null,
+            'status_after'  => $status,
+            'message'       => $reason ? 'Rejection reason: ' . $reason : 'Attendance processed successfully',
+            'context'       => json_encode($context)
         ));
+    }
+
+    /**
+     * Process bulk attendance submissions.
+     * Each item is processed within its own database transaction.
+     * Returns statistics (total, accepted, duplicate, rejected) and individual item statuses.
+     */
+    public function attendances_bulk($header_device_id, $access_raw, $payload, $meta)
+    {
+        $start = microtime(true);
+
+        // 1. Authorization check
+        if (empty($header_device_id) || empty($access_raw)) {
+            $this->log_request($meta, $header_device_id, 401, 'UNAUTHORIZED', $start, $payload);
+            return array('status' => 401, 'error_code' => 'UNAUTHORIZED');
+        }
+
+        // Validate access token
+        $val = $this->auth->validate_access_token($access_raw, $header_device_id);
+        if (!$val['ok']) {
+            $code = ($val['error'] === 'TOKEN_EXPIRED') ? 'TOKEN_EXPIRED' : 'UNAUTHORIZED';
+            $this->log_request($meta, $header_device_id, 401, $code, $start, $payload);
+            return array('status' => 401, 'error_code' => $code);
+        }
+
+        // Verify device exists and is active
+        $device = $this->repo->get_device_by_id($header_device_id);
+        if (!$device || !isset($device['status']) || $device['status'] !== 'active') {
+            $status_code = !$device ? 404 : 403;
+            $err_code = !$device ? 'NOT_FOUND' : 'DEVICE_INACTIVE';
+            $this->log_request($meta, $header_device_id, $status_code, $err_code, $start, $payload);
+            return array('status' => $status_code, 'error_code' => $err_code);
+        }
+
+        // 2. Entire body validation (batch validation)
+        if (!is_array($payload) || empty($payload['batch_id']) || !isset($payload['items']) || !is_array($payload['items'])) {
+            $this->log_request($meta, $header_device_id, 422, 'VALIDATION_ERROR', $start, $payload);
+            return array(
+                'status' => 422,
+                'error_code' => 'VALIDATION_ERROR',
+                'errors' => array('body' => array('Invalid bulk request format. batch_id and items array are required.'))
+            );
+        }
+
+        $batch_id = $payload['batch_id'];
+        $items = $payload['items'];
+        $total_items = count($items);
+        $max_bulk = (int) $this->CI->config->item('fa_max_bulk_attendance', 'face_attendance');
+
+        if ($total_items > $max_bulk) {
+            $this->log_request($meta, $header_device_id, 422, 'MAX_LIMIT_EXCEEDED', $start, $payload);
+            return array(
+                'status' => 422,
+                'error_code' => 'MAX_LIMIT_EXCEEDED',
+                'errors' => array('items' => array('Bulk items count exceeds maximum limit of ' . $max_bulk))
+            );
+        }
+
+        if ($total_items === 0) {
+            $this->log_request($meta, $header_device_id, 422, 'VALIDATION_ERROR', $start, $payload);
+            return array(
+                'status' => 422,
+                'error_code' => 'VALIDATION_ERROR',
+                'errors' => array('items' => array('Items list cannot be empty.'))
+            );
+        }
+
+        // Process individual items
+        $accepted = 0;
+        $duplicate = 0;
+        $rejected = 0;
+        $results = array();
+
+        $allowed_fields = array(
+            'attendance_id', 'employee_code', 'device_id', 'attendance_type',
+            'attendance_at', 'recognition_confidence', 'liveness_score',
+            'face_version', 'photo_base64', 'latitude', 'longitude',
+            'source', 'request_id'
+        );
+
+        $rules = array(
+            'attendance_id'           => 'required|string',
+            'employee_code'           => 'required|string',
+            'device_id'               => 'required|string',
+            'attendance_type'         => 'required|enum:check_in,check_out,break_out,break_in',
+            'attendance_at'           => 'required|string',
+            'recognition_confidence'  => 'score',
+            'liveness_score'          => 'score',
+            'face_version'            => 'integer',
+            'source'                  => 'string',
+            'request_id'              => 'string'
+        );
+
+        foreach ($items as $index => $item) {
+            $item_start = microtime(true);
+            if (!is_array($item)) {
+                $rejected++;
+                $results[] = array(
+                    'index' => $index,
+                    'status' => 'rejected',
+                    'error_code' => 'INVALID_ITEM',
+                    'errors' => array('item' => array('Item must be an object'))
+                );
+                continue;
+            }
+
+            // Filter fields
+            $filtered = array();
+            foreach ($allowed_fields as $f) {
+                if (array_key_exists($f, $item)) {
+                    $filtered[$f] = $item[$f];
+                }
+            }
+
+            // 1. Validation
+            $item_errors = $this->validator->validate($filtered, $rules);
+            if (!empty($item_errors)) {
+                $rejected++;
+                $results[] = array(
+                    'attendance_id' => isset($filtered['attendance_id']) ? $filtered['attendance_id'] : null,
+                    'status' => 'rejected',
+                    'error_code' => 'VALIDATION_ERROR',
+                    'errors' => $item_errors
+                );
+                $this->_log_attendance_event(
+                    isset($filtered['attendance_id']) ? $filtered['attendance_id'] : null,
+                    $header_device_id,
+                    isset($filtered['employee_code']) ? $filtered['employee_code'] : null,
+                    'rejected', 'VALIDATION_ERROR',
+                    isset($filtered['request_id']) ? $filtered['request_id'] : null,
+                    $item_start
+                );
+                continue;
+            }
+
+            // 2. device_id mismatch check
+            if ($filtered['device_id'] !== $header_device_id) {
+                $rejected++;
+                $results[] = array(
+                    'attendance_id' => $filtered['attendance_id'],
+                    'status' => 'rejected',
+                    'error_code' => 'DEVICE_MISMATCH',
+                    'errors' => array('device_id' => array('device_id must match X-Device-ID header'))
+                );
+                $this->_log_attendance_event(
+                    $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                    'rejected', 'DEVICE_MISMATCH',
+                    isset($filtered['request_id']) ? $filtered['request_id'] : null,
+                    $item_start
+                );
+                continue;
+            }
+
+            // 3. Idempotency Check: duplicate device_id + request_id
+            $item_request_id = isset($filtered['request_id']) ? $filtered['request_id'] : null;
+            if (!empty($item_request_id)) {
+                $existing_by_req = $this->repo->find_attendance_by_device_request($header_device_id, $item_request_id);
+                if ($existing_by_req) {
+                    $duplicate++;
+                    $results[] = array(
+                        'attendance_id' => $filtered['attendance_id'],
+                        'status' => 'duplicate',
+                        'error_code' => 'IDEMPOTENT_REPLAY',
+                        'errors' => null
+                    );
+                    $this->_log_attendance_event(
+                        $existing_by_req['attendance_id'], $header_device_id, $existing_by_req['employee_code'],
+                        'duplicate', 'IDEMPOTENT_REPLAY', $item_request_id,
+                        $item_start
+                    );
+                    continue;
+                }
+            }
+
+            // 4. Duplicate attendance_id Check
+            $existing_att = $this->repo->find_attendance_by_id($filtered['attendance_id']);
+            if ($existing_att) {
+                $duplicate++;
+                $results[] = array(
+                    'attendance_id' => $filtered['attendance_id'],
+                    'status' => 'duplicate',
+                    'error_code' => 'DUPLICATE_ATTENDANCE',
+                    'errors' => null
+                );
+                $this->_log_attendance_event(
+                    $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                    'duplicate', 'DUPLICATE_ATTENDANCE', $item_request_id,
+                    $item_start
+                );
+                continue;
+            }
+
+            // 5. Verify employee exists and is active
+            $employee = $this->repo->get_employee_by_code($filtered['employee_code']);
+            if (!$employee) {
+                $rejected++;
+                $results[] = array(
+                    'attendance_id' => $filtered['attendance_id'],
+                    'status' => 'rejected',
+                    'error_code' => 'EMPLOYEE_NOT_FOUND',
+                    'errors' => array('employee_code' => array('Employee not found'))
+                );
+                $this->_log_attendance_event(
+                    $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                    'rejected', 'EMPLOYEE_NOT_FOUND', $item_request_id,
+                    $item_start
+                );
+                continue;
+            }
+            if (!empty($employee['is_deleted']) && (int) $employee['is_deleted'] === 1) {
+                $rejected++;
+                $results[] = array(
+                    'attendance_id' => $filtered['attendance_id'],
+                    'status' => 'rejected',
+                    'error_code' => 'EMPLOYEE_DELETED',
+                    'errors' => array('employee_code' => array('Employee is deleted'))
+                );
+                $this->_log_attendance_event(
+                    $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                    'rejected', 'EMPLOYEE_DELETED', $item_request_id,
+                    $item_start
+                );
+                continue;
+            }
+            if (!isset($employee['status']) || $employee['status'] !== 'active') {
+                $rejected++;
+                $results[] = array(
+                    'attendance_id' => $filtered['attendance_id'],
+                    'status' => 'rejected',
+                    'error_code' => 'EMPLOYEE_INACTIVE',
+                    'errors' => array('employee_code' => array('Employee is inactive'))
+                );
+                $this->_log_attendance_event(
+                    $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                    'rejected', 'EMPLOYEE_INACTIVE', $item_request_id,
+                    $item_start
+                );
+                continue;
+            }
+
+            // 6. Handle optional photo_base64
+            $photo_path = null;
+            $photo_hash = null;
+            if (!empty($filtered['photo_base64'])) {
+                $image_data = $filtered['photo_base64'];
+                $matches = array();
+                if (preg_match('/^data:(image\/(jpeg|png));base64,(.+)$/i', $image_data, $matches)) {
+                    $photo_mime = strtolower($matches[1]);
+                    $image_binary = base64_decode($matches[3], true);
+                    if ($image_binary === false) {
+                        $rejected++;
+                        $results[] = array(
+                            'attendance_id' => $filtered['attendance_id'],
+                            'status' => 'rejected',
+                            'error_code' => 'INVALID_PHOTO',
+                            'errors' => array('photo_base64' => array('Invalid base64 image data'))
+                        );
+                        $this->_log_attendance_event(
+                            $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                            'rejected', 'INVALID_PHOTO', $item_request_id,
+                            $item_start
+                        );
+                        continue;
+                    }
+                    $photo_size_bytes = strlen($image_binary);
+                    $max_size = (int) $this->CI->config->item('fa_max_face_image_size_bytes', 'face_attendance');
+                    if ($max_size > 0 && $photo_size_bytes > $max_size) {
+                        $rejected++;
+                        $results[] = array(
+                            'attendance_id' => $filtered['attendance_id'],
+                            'status' => 'rejected',
+                            'error_code' => 'PHOTO_TOO_LARGE',
+                            'errors' => array('photo_base64' => array('Photo exceeds configured size limit'))
+                        );
+                        $this->_log_attendance_event(
+                            $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                            'rejected', 'PHOTO_TOO_LARGE', $item_request_id,
+                            $item_start
+                        );
+                        continue;
+                    }
+                    // Save photo
+                    $upload_root = rtrim($this->CI->config->item('fa_upload_path', 'face_attendance'), '/') . '/attendances/';
+                    $att_dir = $upload_root . $filtered['attendance_id'] . '/';
+                    if (!is_dir($att_dir)) {
+                        if (!mkdir($att_dir, 0755, true) && !is_dir($att_dir)) {
+                            $rejected++;
+                            $results[] = array(
+                                'attendance_id' => $filtered['attendance_id'],
+                                'status' => 'rejected',
+                                'error_code' => 'INTERNAL_ERROR',
+                                'errors' => array('photo_base64' => array('Failed to create upload directory'))
+                            );
+                            continue;
+                        }
+                    }
+                    $ext = ($photo_mime === 'image/png') ? 'png' : 'jpg';
+                    $filename = 'photo_' . time() . '.' . $ext;
+                    $full_path = $att_dir . $filename;
+                    $relative_dir = 'uploads/face_attendance/attendances/' . $filtered['attendance_id'] . '/';
+                    $photo_path = $relative_dir . $filename;
+                    $photo_hash = hash('sha256', $image_binary);
+
+                    if (file_put_contents($full_path, $image_binary) === false) {
+                        $rejected++;
+                        $results[] = array(
+                            'attendance_id' => $filtered['attendance_id'],
+                            'status' => 'rejected',
+                            'error_code' => 'INTERNAL_ERROR',
+                            'errors' => array('photo_base64' => array('Failed to write photo file'))
+                        );
+                        continue;
+                    }
+                } else {
+                    $rejected++;
+                    $results[] = array(
+                        'attendance_id' => $filtered['attendance_id'],
+                        'status' => 'rejected',
+                        'error_code' => 'INVALID_PHOTO',
+                        'errors' => array('photo_base64' => array('Photo must be a valid data URL'))
+                    );
+                    $this->_log_attendance_event(
+                        $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                        'rejected', 'INVALID_PHOTO', $item_request_id,
+                        $item_start
+                    );
+                    continue;
+                }
+            }
+
+            // Format nominal device timestamp to standard database DATETIME format
+            $dt = date_create($filtered['attendance_at']);
+            $attendance_at_db = $dt ? $dt->format('Y-m-d H:i:s') : null;
+
+            // 7. Save to DB in transaction
+            $att_row = array(
+                'attendance_id'          => $filtered['attendance_id'],
+                'device_id'              => $header_device_id,
+                'employee_code'          => $filtered['employee_code'],
+                'attendance_type'        => $filtered['attendance_type'],
+                'attendance_at'          => $attendance_at_db,
+                'recorded_at'            => date('Y-m-d H:i:s'),
+                'recognition_confidence' => isset($filtered['recognition_confidence']) ? (float) $filtered['recognition_confidence'] : null,
+                'liveness_score'         => isset($filtered['liveness_score']) ? (float) $filtered['liveness_score'] : null,
+                'face_version'           => isset($filtered['face_version']) ? (int) $filtered['face_version'] : null,
+                'photo_path'             => $photo_path,
+                'photo_hash'             => $photo_hash,
+                'latitude'               => isset($filtered['latitude']) ? (float) $filtered['latitude'] : null,
+                'longitude'              => isset($filtered['longitude']) ? (float) $filtered['longitude'] : null,
+                'source'                 => isset($filtered['source']) ? $filtered['source'] : null,
+                'request_id'             => $item_request_id,
+                'batch_id'               => $batch_id,
+                'status'                 => 'accepted'
+            );
+
+            $this->repo->begin();
+            try {
+                $db_id = $this->repo->create_attendance($att_row);
+                if ($db_id === false || $this->CI->db->trans_status() === FALSE) {
+                    throw new Exception('DB insert failed');
+                }
+                $this->repo->commit();
+                $accepted++;
+                $results[] = array(
+                    'attendance_id' => $filtered['attendance_id'],
+                    'status' => 'accepted',
+                    'error_code' => null,
+                    'errors' => null
+                );
+                $this->_log_attendance_event(
+                    $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                    'accepted', null, $item_request_id,
+                    $item_start
+                );
+            } catch (Exception $e) {
+                $this->repo->rollback();
+                if ($photo_path && is_file(FCPATH . $photo_path)) {
+                    @unlink(FCPATH . $photo_path);
+                }
+                $rejected++;
+                $results[] = array(
+                    'attendance_id' => $filtered['attendance_id'],
+                    'status' => 'rejected',
+                    'error_code' => 'INTERNAL_ERROR',
+                    'errors' => array('db' => array($e->getMessage()))
+                );
+                $this->_log_attendance_event(
+                    $filtered['attendance_id'], $header_device_id, $filtered['employee_code'],
+                    'rejected', 'DATABASE_ERROR', $item_request_id,
+                    $item_start
+                );
+            }
+        }
+
+        // Format Response
+        $res_data = array(
+            'batch_id' => $batch_id,
+            'total' => $total_items,
+            'accepted' => $accepted,
+            'duplicate' => $duplicate,
+            'rejected' => $rejected,
+            'items' => $results
+        );
+
+        // Sanitize request payload for API log
+        $clean_payload = $payload;
+        if (isset($clean_payload['items'])) {
+            foreach ($clean_payload['items'] as $idx => $item) {
+                if (isset($item['photo_base64'])) {
+                    $clean_payload['items'][$idx]['photo_base64'] = '[STRIPPED]';
+                }
+            }
+        }
+        $clean_response = array(
+            'success' => true,
+            'message' => 'Bulk attendance processed',
+            'data' => $res_data,
+            'error_code' => null
+        );
+
+        $this->log_request($meta, $header_device_id, 200, null, $start, $clean_payload, $clean_response);
+
+        return array(
+            'status' => 200,
+            'data' => $res_data
+        );
+    }
+
+    /**
+     * Process bulk system log submissions.
+     * Sanitizes contextual data for security and inserts log rows into the DB.
+     */
+    public function system_logs_bulk($header_device_id, $access_raw, $payload, $meta)
+    {
+        $start = microtime(true);
+
+        // 1. Authorization check
+        if (empty($header_device_id) || empty($access_raw)) {
+            $this->log_request($meta, $header_device_id, 401, 'UNAUTHORIZED', $start, $payload);
+            return array('status' => 401, 'error_code' => 'UNAUTHORIZED');
+        }
+
+        // Validate access token
+        $val = $this->auth->validate_access_token($access_raw, $header_device_id);
+        if (!$val['ok']) {
+            $code = ($val['error'] === 'TOKEN_EXPIRED') ? 'TOKEN_EXPIRED' : 'UNAUTHORIZED';
+            $this->log_request($meta, $header_device_id, 401, $code, $start, $payload);
+            return array('status' => 401, 'error_code' => $code);
+        }
+
+        // Verify device exists and is active
+        $device = $this->repo->get_device_by_id($header_device_id);
+        if (!$device || !isset($device['status']) || $device['status'] !== 'active') {
+            $status_code = !$device ? 404 : 403;
+            $err_code = !$device ? 'NOT_FOUND' : 'DEVICE_INACTIVE';
+            $this->log_request($meta, $header_device_id, $status_code, $err_code, $start, $payload);
+            return array('status' => $status_code, 'error_code' => $err_code);
+        }
+
+        // 2. Entire body validation (batch validation)
+        if (!is_array($payload) || empty($payload['batch_id']) || !isset($payload['items']) || !is_array($payload['items'])) {
+            $this->log_request($meta, $header_device_id, 422, 'VALIDATION_ERROR', $start, $payload);
+            return array(
+                'status' => 422,
+                'error_code' => 'VALIDATION_ERROR',
+                'errors' => array('body' => array('Invalid bulk request format. batch_id and items array are required.'))
+            );
+        }
+
+        $batch_id = $payload['batch_id'];
+        $items = $payload['items'];
+        $total_items = count($items);
+        $max_bulk = (int) $this->CI->config->item('fa_max_bulk_system_logs', 'face_attendance');
+
+        if ($total_items > $max_bulk) {
+            $this->log_request($meta, $header_device_id, 422, 'MAX_LIMIT_EXCEEDED', $start, $payload);
+            return array(
+                'status' => 422,
+                'error_code' => 'MAX_LIMIT_EXCEEDED',
+                'errors' => array('items' => array('Bulk items count exceeds maximum limit of ' . $max_bulk))
+            );
+        }
+
+        if ($total_items === 0) {
+            $this->log_request($meta, $header_device_id, 422, 'VALIDATION_ERROR', $start, $payload);
+            return array(
+                'status' => 422,
+                'error_code' => 'VALIDATION_ERROR',
+                'errors' => array('items' => array('Items list cannot be empty.'))
+            );
+        }
+
+        // Process individual items
+        $accepted = 0;
+        $duplicate = 0;
+        $rejected = 0;
+        $results = array();
+
+        $allowed_fields = array(
+            'log_id', 'logged_at', 'level', 'event_type', 'message', 'context', 'request_id'
+        );
+
+        $rules = array(
+            'log_id'     => 'required|string',
+            'logged_at'  => 'required|string',
+            'level'      => 'required|enum:DEBUG,INFO,WARNING,ERROR,CRITICAL',
+            'event_type' => 'required|string',
+            'message'    => 'required|string',
+            'request_id' => 'string'
+        );
+
+        foreach ($items as $index => $item) {
+            if (!is_array($item)) {
+                $rejected++;
+                $results[] = array(
+                    'index' => $index,
+                    'status' => 'rejected',
+                    'error_code' => 'INVALID_ITEM',
+                    'errors' => array('item' => array('Item must be an object'))
+                );
+                continue;
+            }
+
+            // Filter fields
+            $filtered = array();
+            foreach ($allowed_fields as $f) {
+                if (array_key_exists($f, $item)) {
+                    $filtered[$f] = $item[$f];
+                }
+            }
+
+            // 1. Validation
+            $item_errors = $this->validator->validate($filtered, $rules);
+            if (!empty($item_errors)) {
+                $rejected++;
+                $results[] = array(
+                    'log_id' => isset($filtered['log_id']) ? $filtered['log_id'] : null,
+                    'status' => 'rejected',
+                    'error_code' => 'VALIDATION_ERROR',
+                    'errors' => $item_errors
+                );
+                continue;
+            }
+
+            // 2. Duplicate log_id check
+            $existing_log = $this->repo->find_system_log_by_id($filtered['log_id']);
+            if ($existing_log) {
+                $duplicate++;
+                $results[] = array(
+                    'log_id' => $filtered['log_id'],
+                    'status' => 'duplicate',
+                    'error_code' => 'DUPLICATE_LOG',
+                    'errors' => null
+                );
+                continue;
+            }
+
+            // 3. Sanitize Context (strip device secret, token, embeddings, images)
+            $clean_context = isset($filtered['context']) ? $this->_sanitize_context($filtered['context']) : null;
+
+            // Convert logged_at to DB format
+            $dt = date_create($filtered['logged_at']);
+            $logged_at_db = $dt ? $dt->format('Y-m-d H:i:s') : null;
+
+            // 4. Save to DB
+            $log_row = array(
+                'log_id'     => $filtered['log_id'],
+                'device_id'  => $header_device_id, // Store device_id from header/token, not payload
+                'batch_id'   => $batch_id,
+                'logged_at'  => $logged_at_db,
+                'level'      => $filtered['level'],
+                'event_type' => $filtered['event_type'],
+                'message'    => $filtered['message'],
+                'context'    => $clean_context ? json_encode($clean_context) : null,
+                'request_id' => isset($filtered['request_id']) ? $filtered['request_id'] : null
+            );
+
+            $inserted_id = $this->repo->create_system_log($log_row);
+            if ($inserted_id) {
+                $accepted++;
+                $results[] = array(
+                    'log_id' => $filtered['log_id'],
+                    'status' => 'accepted',
+                    'error_code' => null,
+                    'errors' => null
+                );
+            } else {
+                $rejected++;
+                $results[] = array(
+                    'log_id' => $filtered['log_id'],
+                    'status' => 'rejected',
+                    'error_code' => 'DATABASE_ERROR',
+                    'errors' => array('db' => array('Failed to insert system log'))
+                );
+            }
+        }
+
+        // Format Response
+        $res_data = array(
+            'batch_id' => $batch_id,
+            'total' => $total_items,
+            'accepted' => $accepted,
+            'duplicate' => $duplicate,
+            'rejected' => $rejected,
+            'items' => $results
+        );
+
+        // Clean payload for API log
+        $clean_payload = $payload;
+        if (isset($clean_payload['items'])) {
+            foreach ($clean_payload['items'] as $idx => $item) {
+                if (isset($item['context'])) {
+                    $clean_payload['items'][$idx]['context'] = $this->_sanitize_context($item['context']);
+                }
+            }
+        }
+
+        $clean_response = array(
+            'success' => true,
+            'message' => 'Bulk system logs processed',
+            'data' => $res_data,
+            'error_code' => null
+        );
+
+        $this->log_request($meta, $header_device_id, 200, null, $start, $clean_payload, $clean_response);
+
+        return array(
+            'status' => 200,
+            'data' => $res_data
+        );
+    }
+
+    /**
+     * Recursively sanitizes logs context arrays to prevent saving sensitive fields.
+     */
+    protected function _sanitize_context($context)
+    {
+        if (!is_array($context)) {
+            return $context;
+        }
+        $sensitive_keys = array(
+            'device_secret',
+            'access_token',
+            'refresh_token',
+            'image_base64',
+            'photo_base64',
+            'embedding',
+            'photo_raw',
+            'biometric_payload',
+            'payload'
+        );
+        foreach ($context as $key => $val) {
+            if (in_array(strtolower($key), $sensitive_keys, true)) {
+                unset($context[$key]);
+            } elseif (is_array($val)) {
+                $context[$key] = $this->_sanitize_context($val);
+            }
+        }
+        return $context;
     }
 
 }

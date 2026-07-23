@@ -1,18 +1,24 @@
 <IfModule mod_rewrite.c>
     RewriteEngine On
-    
-    # If your project is in a subfolder (e.g., localhost/myproject/), 
+
+    # If your project is in a subfolder (e.g., localhost/myproject/),
     # uncomment the line below and change it to: RewriteBase /myproject/
     # RewriteBase /
 
     # Prevent directory listing and access to sensitive core folders
     Options -Indexes
-    
-    # Checks if the request is an actual file or directory
-    # If it is, Apache serves it directly (assets, CSS, JS, images)
+
+    # Pass the Authorization header to PHP via environment variable.
+    # IMPORTANT: No [L] flag here — processing must continue to the index.php rewrite below.
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule ^ - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Checks if the request is an actual file or directory.
+    # If it is, Apache serves it directly (assets, CSS, JS, images).
     RewriteCond %{REQUEST_FILENAME} !-f
     RewriteCond %{REQUEST_FILENAME} !-d
-    
+
     # Rewrites all other URLs to index.php
     RewriteRule ^(.*)$ index.php?/$1 [L,QSA]
+
 </IfModule>

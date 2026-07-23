@@ -76,13 +76,13 @@ class Face_attendance_auth
         if (!$row) {
             return array('ok' => false, 'error' => 'UNAUTHORIZED');
         }
-        if (!empty($row['revoked'])) {
+        if (!empty($row['revoked_at'])) {
             return array('ok' => false, 'error' => 'UNAUTHORIZED');
         }
         if ($row['device_id'] !== $device_id) {
             return array('ok' => false, 'error' => 'UNAUTHORIZED');
         }
-        if (isset($row['expires_at']) && strtotime($row['expires_at']) < time()) {
+        if (isset($row['access_expires_at']) && strtotime($row['access_expires_at']) < time()) {
             return array('ok' => false, 'error' => 'TOKEN_EXPIRED');
         }
 
@@ -102,7 +102,7 @@ class Face_attendance_auth
         if (!$row) {
             return array('ok' => false, 'error' => 'UNAUTHORIZED');
         }
-        if (!empty($row['revoked'])) {
+        if (!empty($row['revoked_at'])) {
             return array('ok' => false, 'error' => 'UNAUTHORIZED');
         }
         if ($row['device_id'] !== $device_id) {

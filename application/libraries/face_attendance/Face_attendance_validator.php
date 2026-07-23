@@ -15,6 +15,7 @@ class Face_attendance_validator
         $errors = array();
 
         foreach ($rules as $field => $rlist) {
+            $field = strtolower($field);
             $value = isset($data[$field]) ? $data[$field] : null;
             $rulesArray = is_array($rlist) ? $rlist : explode('|', $rlist);
 
